@@ -594,7 +594,9 @@ def apply_2025_concept_drift(claim: dict, policy: dict, month: int) -> dict:
 # =============================================================================
 
 def main():
-    base_dir    = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    # base_dir    = os.path.dirname(os.path.abspath(__file__))
+    base_dir = os.path.join(project_root, "data")
     events_dir        = os.path.join(base_dir, "events")
     source_buffer_dir = os.path.join(base_dir, "source_buffer")
     context_dir = os.path.join(base_dir, "context")
