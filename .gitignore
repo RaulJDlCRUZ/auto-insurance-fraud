@@ -1,0 +1,25 @@
+# === Synthetic data generation outputs ===
+src/data_generation/events/
+src/data_generation/source_buffer/
+src/data_generation/context/
+
+# === Other data directories (if new organization is applied) ===
+data/events/
+data/source_buffer/
+data/context/
+data/raw/
+data/intermediate/
+
+# === Python ===
+__pycache__/
+*.pyc
+
+# === Databricks ===
+.databricks/
+databricks/.cache/
+
+# === Logs ===
+*.log
+
+# === VS Code (opcional) ===
+.vscode/
