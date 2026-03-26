@@ -1,0 +1,3 @@
+# `rules`
+
+> Aquí van EXPECTATIONS y VALIDACIONES
