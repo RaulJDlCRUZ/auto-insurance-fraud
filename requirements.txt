@@ -1,4 +1,4 @@
 pyspark
 delta-spark
 duckdb
-pol
+polars
