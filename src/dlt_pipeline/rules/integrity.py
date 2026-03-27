@@ -1,0 +1,25 @@
+def get_integrity_rules():
+    return [
+
+        {
+            "name": "claim_policy_fk_valid",
+            "constraint": "policy_id IS NOT NULL",
+            "severity": "error",
+            "tag": "claims_enriched"
+        },
+
+        {
+            "name": "label_claim_fk_valid",
+            "constraint": "claim_id IS NOT NULL",
+            "severity": "error",
+            "tag": "labels_enriched"
+        },
+
+        {
+            "name": "label_after_claim_timestamp",
+            "constraint": "label_available_date >= timestamp",
+            "severity": "warn",
+            "tag": "labels"
+        }
+
+    ]

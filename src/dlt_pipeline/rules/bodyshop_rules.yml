@@ -1,0 +1,8 @@
+table: bodyshop_risk_flags
+
+rules:
+
+  - name: bodyshop_flag_binary
+    constraint: "is_high_risk_body_shop IN (0, 1)"
+    severity: warn
+    tag: claims_enriched

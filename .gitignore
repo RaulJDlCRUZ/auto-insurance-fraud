@@ -3,6 +3,13 @@ src/data_generation/events/
 src/data_generation/source_buffer/
 src/data_generation/context/
 
+# == Delta Lake artifacts ===
+pipelines/
+
+# Spark checkpoints and logs
+spark-logs/
+_checkpoints/
+
 # === Other data directories (if new organization is applied) ===
 data/events/
 data/source_buffer/
@@ -23,3 +30,9 @@ databricks/.cache/
 
 # === VS Code (opcional) ===
 .vscode/
+
+# === Jupyter Notebook checkpoints (opcional) ===
+.ipynb_checkpoints/
+
+# WSL / Linux temporary files
+*.swp
