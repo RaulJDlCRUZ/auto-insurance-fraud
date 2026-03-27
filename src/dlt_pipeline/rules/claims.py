@@ -1,0 +1,84 @@
+def get_claims_rules():
+    return [
+
+        {
+            "name": "claim_id_not_null",
+            "constraint": "claim_id IS NOT NULL",
+            "severity": "error",
+            "tag": "claims"
+        },
+
+        {
+            "name": "policy_id_not_null",
+            "constraint": "policy_id IS NOT NULL",
+            "severity": "error",
+            "tag": "claims"
+        },
+
+        {
+            "name": "timestamp_not_null",
+            "constraint": "timestamp IS NOT NULL",
+            "severity": "error",
+            "tag": "claims"
+        },
+
+        {
+            "name": "claimed_amount_positive",
+            "constraint": "claimed_amount_eur > 0",
+            "severity": "error",
+            "tag": "claims"
+        },
+
+        {
+            "name": "days_to_report_valid",
+            "constraint": "days_to_report >= 0",
+            "severity": "error",
+            "tag": "claims"
+        },
+
+        {
+            "name": "n_parties_valid",
+            "constraint": "n_parties_involved >= 1",
+            "severity": "error",
+            "tag": "claims"
+        },
+
+        {
+            "name": "valid_claim_channel",
+            "constraint": """
+                claim_channel IN (
+                    'phone',
+                    'web',
+                    'agent',
+                    'app_selfservice'
+                )
+            """,
+            "severity": "warn",
+            "tag": "claims"
+        },
+
+        {
+            "name": "injury_requires_multiple_parties",
+            "constraint": """
+                injury_level = 'none'
+                OR n_parties_involved >= 2
+            """,
+            "severity": "warn",
+            "tag": "claims"
+        },
+
+        {
+            "name": "telematics_requires_device",
+            "constraint": "telematics_anomaly = 0",
+            "severity": "warn",
+            "tag": "claims"
+        },
+        
+        # {
+        #     "name": "reasonable_claim_amount_vs_vehicle",
+        #     "constraint": "claimed_amount_eur <= vehicle_value_eur * 1.5",
+        #     "severity": "warn",
+        #     "tag": "claims"
+        # }
+
+    ]

@@ -1,0 +1,23 @@
+table: derived_claims_features
+
+rules:
+
+  - name: event_year_exists
+    constraint: "event_year IS NOT NULL"
+    severity: warn
+    tag: claims
+
+  - name: event_month_exists
+    constraint: "event_month IS NOT NULL"
+    severity: warn
+    tag: claims
+
+  - name: event_date_exists
+    constraint: "event_date IS NOT NULL"
+    severity: warn
+    tag: claims
+
+  - name: label_delay_days_valid
+    constraint: "label_delay_days >= 0"
+    severity: warn
+    tag: claims
