@@ -1,5 +1,3 @@
-# src/dlt_pipeline/transformations/silver/02_silver_transformation.py
-
 from delta import configure_spark_with_delta_pip
 from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql import functions as F
