@@ -1,269 +1,291 @@
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import (
-    col, expr, struct, to_timestamp, to_date, year, month, datediff, current_timestamp, lit, to_json
-)
-import yaml
+# src/dlt_pipeline/transformations/silver/02_silver_transformation.py
+
 from delta import configure_spark_with_delta_pip
-from pathlib import Path
+from pyspark.sql import SparkSession, DataFrame
+from pyspark.sql import functions as F
+from pyspark.sql.types import (
+    IntegerType, DoubleType, TimestampType, DateType
+)
+from src.dlt_pipeline.rules import get_rules_for
+from pyspark.sql.functions import broadcast
 
-# ========================
-# PATH RESOLUTION
-# ========================
+# ─────────────────────────────────────────────────────────────────────────────
+# Spark session
+# ─────────────────────────────────────────────────────────────────────────────
 
-PROJECT_ROOT = Path(__file__).resolve().parents[4]
+spark = configure_spark_with_delta_pip(
+    SparkSession.builder
+    .appName("silver-transformation")
+    .config("spark.sql.extensions",
+            "io.delta.sql.DeltaSparkSessionExtension")
+    .config("spark.sql.catalog.spark_catalog",
+            "org.apache.spark.sql.delta.catalog.DeltaCatalog")
+    # Memoria y spill para WSL2
+    .config("spark.driver.memory", "4g")
+    .config("spark.executor.memory", "4g")
+    .config("spark.memory.fraction", "0.6")
+    .config("spark.memory.storageFraction", "0.3")
+    .config("spark.sql.shuffle.partitions", "16")
+    .config("spark.local.dir", "/tmp/spark-tmp")
+).getOrCreate()
 
-BRONZE_BASE_PATH = PROJECT_ROOT / "pipelines" / "bronze"
-SILVER_BASE_PATH = PROJECT_ROOT / "pipelines" / "silver"
+BRONZE_PATH = "pipelines/bronze"
+SILVER_PATH = "pipelines/silver"
 
-# Ensure Silver directories exist
-SILVER_BASE_PATH.mkdir(parents=True, exist_ok=True)
 
-RULES_PATH = PROJECT_ROOT / "src" / "dlt_pipeline" / "rules"
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
-BRONZE_PATHS = {
-    "claims": str(BRONZE_BASE_PATH / "claims"),
-    "labels": str(BRONZE_BASE_PATH / "labels"),
-    "policies": str(BRONZE_BASE_PATH / "policies")
-}
+def _build_flag(constraint: str) -> F.Column:
+    """Convierte una constraint SQL en una columna booleana."""
+    return F.expr(constraint)
 
-SILVER_PATHS = {
-    "claims": str(SILVER_BASE_PATH / "claims"),
-    "claims_enriched": str(SILVER_BASE_PATH / "claims_enriched"),
-    "labels": str(SILVER_BASE_PATH / "labels"),
-    "policies": str(SILVER_BASE_PATH / "policies"),
-    "quarantine": str(SILVER_BASE_PATH / "quarantine")
-}
 
-# ========================
-# SPARK SESSION
-# ========================
+def apply_rules(
+    df: DataFrame,
+    tag: str,
+) -> tuple[DataFrame, DataFrame, DataFrame]:
+    """
+    Aplica las reglas de calidad de un tag dado sobre un DataFrame.
 
-builder = (
-    SparkSession.builder.appName("silver_transformation")
-    .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
-    .config(
-        "spark.sql.catalog.spark_catalog",
-        "org.apache.spark.sql.delta.catalog.DeltaCatalog"
+    Devuelve tres DataFrames:
+        clean      — registros que pasan TODAS las reglas
+        quarantine — registros que fallan al menos una regla con action='quarantine'
+        warn_log   — filas con las reglas 'warn' que fallaron (para logging)
+    """
+    rules = get_rules_for(tag)
+
+    drop_rules = [r for r in rules if r["action"] == "drop"]
+    quarantine_rules = [r for r in rules if r["action"] == "quarantine"]
+    warn_rules = [r for r in rules if r["action"] == "warn"]
+
+    # 1. Drop: eliminar silenciosamente si falla cualquier regla drop
+    if drop_rules:
+        drop_condition = F.lit(True)
+        for rule in drop_rules:
+            drop_condition = drop_condition & _build_flag(rule["constraint"])
+        df = df.filter(drop_condition)
+
+    # 2. Quarantine: separar los registros que fallan alguna regla quarantine
+    if quarantine_rules:
+        quarantine_condition = F.lit(False)
+        failed_rule_exprs = []
+        for rule in quarantine_rules:
+            flag = _build_flag(rule["constraint"])
+            quarantine_condition = quarantine_condition | ~flag
+            failed_rule_exprs.append(
+                F.when(~flag, F.lit(rule["name"]))
+            )
+
+        quarantine_df = (
+            df.filter(quarantine_condition)
+            .withColumn(
+                "failed_rules",
+                F.array(*[
+                    F.when(~_build_flag(r["constraint"]), F.lit(r["name"]))
+                    for r in quarantine_rules
+                ])
+            )
+            .withColumn(
+                "failed_rules",
+                F.expr("filter(failed_rules, x -> x is not null)")
+            )
+            .withColumn("quarantine_timestamp", F.current_timestamp())
+            .withColumn("entity", F.lit(tag))
+        )
+        clean_df = df.filter(~quarantine_condition)
+    else:
+        quarantine_df = spark.createDataFrame([], df.schema)
+        clean_df = df
+
+    # 3. Warn: registrar en log pero dejar pasar el registro
+    if warn_rules:
+        warn_condition = F.lit(False)
+        for rule in warn_rules:
+            warn_condition = warn_condition | ~_build_flag(rule["constraint"])
+        warn_log_df = (
+            clean_df.filter(warn_condition)
+            .withColumn(
+                "warned_rules",
+                F.array(*[
+                    F.when(~_build_flag(r["constraint"]), F.lit(r["name"]))
+                    for r in warn_rules
+                ])
+            )
+            .withColumn(
+                "warned_rules",
+                F.expr("filter(warned_rules, x -> x is not null)")
+            )
+            .withColumn("warn_timestamp", F.current_timestamp())
+        )
+    else:
+        warn_log_df = spark.createDataFrame([], df.schema)
+
+    return clean_df, quarantine_df, warn_log_df
+
+
+def write_delta(df: DataFrame, path: str, partition_by: list[str] | None = None) -> None:
+    writer = (
+        df.write
+        .format("delta")
+        .mode("overwrite")
+        .option("overwriteSchema", "true")
+    )
+    if partition_by:
+        writer = writer.partitionBy(*partition_by)
+    writer.save(path)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. POLICIES
+# Primero porque claims necesita has_telematics para su regla condicional
+# ─────────────────────────────────────────────────────────────────────────────
+
+raw_policies = spark.read.format("delta").load(f"{BRONZE_PATH}/policies")
+
+policies = (
+    raw_policies
+    # Casting: bronce leyó todo como string desde el CSV
+    .withColumn("policyholder_age",   F.col("policyholder_age").cast(IntegerType()))
+    .withColumn("vehicle_year",       F.col("vehicle_year").cast(IntegerType()))
+    .withColumn("vehicle_value_eur",  F.col("vehicle_value_eur").cast(DoubleType()))
+    .withColumn("annual_premium_eur", F.col("annual_premium_eur").cast(DoubleType()))
+    .withColumn("bonus_malus_years",  F.col("bonus_malus_years").cast(IntegerType()))
+    .withColumn("annual_mileage_km",  F.col("annual_mileage_km").cast(IntegerType()))
+    .withColumn("has_telematics",     F.col("has_telematics").cast(IntegerType()))
+    .withColumn("multi_policy",       F.col("multi_policy").cast(IntegerType()))
+    .withColumn("is_electric",        F.col("is_electric").cast(IntegerType()))
+    # Fechas
+    .withColumn("policy_start_date",  F.to_date("policy_start_date"))
+    .withColumn("policy_updated_at",  F.to_timestamp("policy_updated_at"))
+    # Columnas de auditoría silver
+    .withColumn("silver_timestamp",   F.current_timestamp())
+    # Quitar columnas de auditoría bronce que no pertenecen a silver
+    .drop("source_file", "year", "month")
+)
+
+policies_clean, policies_quarantine, policies_warn = apply_rules(policies, "policies")
+
+write_delta(policies_clean, f"{SILVER_PATH}/policies")
+write_delta(policies_quarantine, f"{SILVER_PATH}/policies_quarantine")
+
+if policies_warn.count() > 0:
+    policies_warn.show(10, truncate=False)
+
+print(f"[policies] clean={policies_clean.count()} | quarantine={policies_quarantine.count()}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2. CLAIMS
+# Requiere join con policies para las reglas condicionales de telematics
+# ─────────────────────────────────────────────────────────────────────────────
+
+raw_claims = spark.read.format("delta").load(f"{BRONZE_PATH}/claims")
+
+# Traemos solo has_telematics de policies para la regla condicional
+policies_telematics = policies_clean.select("policy_id", "has_telematics")
+
+claims = (
+    raw_claims
+    .withColumn("timestamp",       F.to_timestamp("timestamp"))
+    .withColumn("silver_timestamp", F.current_timestamp())
+    .drop("source_file", "year", "month")
+    # Join para poder evaluar la regla telematics_anomaly_requires_device
+    .join(policies_telematics, on="policy_id", how="left")
+)
+
+claims_clean, claims_quarantine, claims_warn = apply_rules(claims, "claims")
+
+# Quitamos has_telematics del output final de claims (pertenece a policies)
+claims_clean = claims_clean.drop("has_telematics")
+claims_quarantine = claims_quarantine.drop("has_telematics")
+
+# Reconstruimos year/month desde timestamp para el particionado
+claims_clean_partitioned = (
+    claims_clean
+    .withColumn("year",  F.date_format("timestamp", "yyyy"))
+    .withColumn("month", F.date_format("timestamp", "MM"))
+)
+
+write_delta(claims_clean_partitioned, f"{SILVER_PATH}/claims", partition_by=["year", "month"])
+write_delta(claims_quarantine, f"{SILVER_PATH}/claims_quarantine")
+
+if claims_warn.count() > 0:
+    claims_warn.show(10, truncate=False)
+
+print(f"[claims] clean={claims_clean.count()} | quarantine={claims_quarantine.count()}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. LABELS
+# ─────────────────────────────────────────────────────────────────────────────
+
+raw_labels = spark.read.format("delta").load(f"{BRONZE_PATH}/labels")
+
+labels = (
+    raw_labels
+    .withColumn("label_available_date", F.to_timestamp("label_available_date"))
+    .withColumn("silver_timestamp",     F.current_timestamp())
+    .drop("source_file", "year", "month")
+)
+
+labels_clean, labels_quarantine, labels_warn = apply_rules(labels, "labels")
+
+write_delta(labels_clean, f"{SILVER_PATH}/labels")
+write_delta(labels_quarantine, f"{SILVER_PATH}/labels_quarantine")
+
+print(f"[labels] clean={labels_clean.count()} | quarantine={labels_quarantine.count()}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. INTEGRIDAD REFERENCIAL
+# Se aplica sobre las tablas silver ya limpias
+# ─────────────────────────────────────────────────────────────────────────────
+
+# 4a. claims -> policies: todo claim debe tener su policy en silver
+claims_integrity = (
+    claims_clean_partitioned
+    .join(
+        broadcast(policies_clean.select(F.col("policy_id").alias("policy_found"))),
+        on=F.col("policy_id") == F.col("policy_found"),
+        how="left",
     )
 )
 
-spark = configure_spark_with_delta_pip(builder).getOrCreate()
+claims_integrity_clean, claims_integrity_q, _ = apply_rules(
+    claims_integrity, "integrity_claims"
+)
+claims_final = claims_integrity_clean.drop("policy_found")
+claims_orphans = claims_integrity_q.drop("policy_found")
 
-# ========================
-# LOAD RULES YAML
-# ========================
- 
-def load_rules(filename):
-    with open(RULES_PATH / filename) as f:
-        return yaml.safe_load(f)["rules"]
+write_delta(
+    claims_final,
+    f"{SILVER_PATH}/claims",
+    partition_by=["year", "month"],
+)
+if claims_orphans.count() > 0:
+    write_delta(claims_orphans, f"{SILVER_PATH}/claims_quarantine")
 
-claims_rules = load_rules("claims_rules.yml")
-labels_rules = load_rules("labels_rules.yml")
-policies_rules = load_rules("policies_rules.yml")
+print(f"[integrity claims] orphans={claims_orphans.count()}")
 
-# ========================
-# DLQ METADATA FUNCTION
-# ========================
-def add_dlq_metadata(df, rule_name, severity, constraint, source):
-    return (
-        df.withColumn("error_rule", lit(rule_name))
-          .withColumn("error_severity", lit(severity))
-          .withColumn("error_constraint", lit(constraint))
-          .withColumn("error_source", lit(source))
+# 4b. labels -> claims: toda label debe tener su claim en silver
+labels_integrity = (
+    labels_clean
+    .join(
+        broadcast(claims_final.select(F.col("claim_id").alias("claim_found"))),
+        on=F.col("claim_id") == F.col("claim_found"),
+        how="left",
     )
-
-def dedupe_columns(df):
-    seen = set()
-    new_cols = []
-    for c in df.columns:
-        if c not in seen:
-            new_cols.append(c)
-            seen.add(c)
-        else:
-            # Duplicate column → rename it
-            new_cols.append(f"{c}_dup")
-    return df.toDF(*new_cols)
-
-
-def normalize_dlq(df, rule):
-    """
-    Converts any invalid-row DF into a consistent DLQ schema.
-    Works in Spark local and Databricks.
-    The JOIN produces duplicated column names! We need to dedupe them before converting to JSON.
-    """
-
-    df = dedupe_columns(df)
-
-    return (
-        df
-        .withColumn("record_json", to_json(struct([col(c) for c in df.columns])))
-        .select("record_json")
-        .withColumn("error_rule", lit(rule.get("name")))
-        .withColumn("error_severity", lit(rule.get("severity")))
-        .withColumn("error_constraint", lit(rule.get("constraint")))
-        .withColumn("error_source_table", lit(rule.get("tag")))
-        .withColumn("error_timestamp", current_timestamp())
-    )
-
-
-# ========================
-# GENERIC RULE APPLIER
-# ========================
-
-def apply_rules(df, rules):
-    """
-    Applies validation rules to a DataFrame.
-    Returns a cleaned DataFrame and a quarantine DataFrame.
-    """
-
-    quarantine_df = None
-
-    for rule in rules:
-        condition = rule["constraint"]
-        severity = rule["severity"]
-
-        invalid_rows = df.filter(f"NOT ({condition})")
-
-        # Convert invalid rows into DLQ-standard schema
-        invalid_rows = normalize_dlq(invalid_rows, rule)
-
-        # invalid_rows = df.filter(f"NOT ({condition})")
-
-        # # Add metadata BEFORE sending to quarantine
-        
-        # invalid_rows = add_dlq_metadata(
-        #     invalid_rows,
-        #     rule_name=rule["name"],
-        #     severity=rule["severity"],
-        #     constraint=rule["constraint"],
-        #     source=rule.get("tag", "unknown")
-        # )
-
-        if severity == "error":
-            # Collect invalid rows
-            if quarantine_df is None:
-                quarantine_df = invalid_rows
-            else:
-                quarantine_df = quarantine_df.union(invalid_rows)
-
-            # Keep valid rows
-            df = df.filter(condition)
-
-        else:
-            # Add warning flag as a boolean column
-            df = df.withColumn(f"warn_{rule['name']}", expr(f"NOT ({condition})"))
-
-    return df, quarantine_df
-
-# ========================
-# LOAD BRONZE TABLES
-# ========================
-
-claims = spark.read.format("delta").load(BRONZE_PATHS["claims"])
-labels = spark.read.format("delta").load(BRONZE_PATHS["labels"])
-policies = spark.read.format("delta").load(BRONZE_PATHS["policies"])
-
-# ========================
-# TYPE CASTING
-# ========================
-
-claims = claims.withColumn("timestamp", to_timestamp("timestamp"))
-labels = labels.withColumn("label_available_date", to_timestamp("label_available_date"))
-policies = policies.withColumn("policy_start_date", to_date("policy_start_date"))
-
-# ========================
-# APPLY RULES
-# ========================
-
-claims_clean, claims_quarantine = apply_rules(claims, claims_rules)
-labels_clean, labels_quarantine = apply_rules(labels, labels_rules)
-policies_clean, policies_quarantine = apply_rules(policies, policies_rules)
-
-# ========================
-# REFERENTIAL INTEGRITY
-# ========================
-
-claims_enriched = claims_clean.join(policies_clean, "policy_id", "left")
-
-
-claims_fk_invalid = claims_enriched.filter(
-    col("policy_start_date").isNull()
 )
 
-# Normalize FK invalid rows into DLQ schema
-claims_fk_invalid = normalize_dlq(
-    claims_fk_invalid,
-    {
-        "name": "policy_fk_missing",
-        "severity": "error",
-        "constraint": "policy_start_date IS NOT NULL",
-        "tag": "claims_enriched"
-    }
+labels_integrity_clean, labels_integrity_q, _ = apply_rules(
+    labels_integrity, "integrity_labels"
 )
+labels_final = labels_integrity_clean.drop("claim_found")
+labels_orphans = labels_integrity_q.drop("claim_found")
 
-claims_enriched = claims_enriched.filter(col("policy_start_date").isNotNull())
+write_delta(labels_final, f"{SILVER_PATH}/labels")
+if labels_orphans.count() > 0:
+    write_delta(labels_orphans, f"{SILVER_PATH}/labels_quarantine")
 
-# ========================
-# DERIVED FEATURES
-# ========================
+print(f"[integrity labels] orphans={labels_orphans.count()}")
 
-claims_enriched = (
-    claims_enriched.withColumn("event_date", to_date("timestamp"))
-                   .withColumn("event_year", year("timestamp"))
-                   .withColumn("event_month", month("timestamp"))
-)
-
-claims_with_labels = claims_enriched.join(labels_clean, "claim_id", "left")
-
-claims_with_labels = claims_with_labels.withColumn(
-    "label_delay_days",
-    datediff(col("label_available_date"), col("timestamp"))
-)
-
-# ========================
-# QUARANTINE UNION
-# ========================
-
-# quarantine_all = None
-
-# for qdf in [claims_quarantine, labels_quarantine, policies_quarantine, claims_fk_invalid]:
-#     if qdf is not None:
-#         if quarantine_all is None:
-#             quarantine_all = qdf
-#         else:
-#             quarantine_all = quarantine_all.unionByName(qdf, allowMissingColumns=True)
-
-# Collect all DLQ DFs
-quarantine_dfs = [
-    q
-    for q in [
-        claims_quarantine,
-        labels_quarantine,
-        policies_quarantine,
-        claims_fk_invalid
-    ]
-    if q is not None
-]
-
-# If any exist → union safely
-if quarantine_dfs:
-    quarantine_all = quarantine_dfs[0]
-    for qdf in quarantine_dfs[1:]:
-        quarantine_all = quarantine_all.unionByName(qdf)
-else:
-    quarantine_all = None
-
-# ========================
-# WRITE SILVER TABLES
-# ========================
-
-claims_clean.write.format("delta").mode("overwrite").save(SILVER_PATHS["claims"])
-labels_clean.write.format("delta").mode("overwrite").save(SILVER_PATHS["labels"])
-policies_clean.write.format("delta").mode("overwrite").save(SILVER_PATHS["policies"])
-
-claims_with_labels.write.format("delta").mode("overwrite").save(SILVER_PATHS["claims_enriched"])
-
-if quarantine_all is not None:
-    quarantine_all.write.format("delta").mode("overwrite").save(SILVER_PATHS["quarantine"])
-
-print("Silver transformation completed successfully.")
+print("\n=== Silver pipeline completado ===")
