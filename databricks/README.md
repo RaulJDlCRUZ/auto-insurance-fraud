@@ -1,0 +1,1 @@
+> Muchos de los ficheros que se listarán a continuación no son de mi autoría al 100%, sino que son del docente Juan Carlos Alfaro Jiménez, quien es el autor legítimo de los recursos base sobre el que se han hecho adaptaciones o reescrituras completas. Los ficheros con sufijo OG son los referentes a los originales o poco modificados, antes de abandonar Spark MLlib
