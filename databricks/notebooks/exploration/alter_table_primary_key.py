@@ -27,7 +27,7 @@ spark.sql("ALTER TABLE workspace.auto_insurance_fraud.customer_aggregations ALTE
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC # Primary key de customer_profile
+# MAGIC ## Primary key de `customer_profile`
 # MAGIC
 # MAGIC `policy_id + __START_AT` (SCD Type 2 — clave compuesta)
 
@@ -41,7 +41,7 @@ spark.sql("""
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC # Primary key de customer_aggregations
+# MAGIC ## Primary key de `customer_aggregations`
 # MAGIC `claim_id` es único por fila
 
 # COMMAND ----------
@@ -50,4 +50,33 @@ spark.sql("""
 spark.sql("""
     ALTER TABLE workspace.auto_insurance_fraud.customer_aggregations
     ADD CONSTRAINT customer_aggregations_pk PRIMARY KEY (policy_id, claim_timestamp TIMESERIES)
+""")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC --------------------------------
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Primary key de `customer_aggregations_inference`
+
+# COMMAND ----------
+
+spark.sql("ALTER TABLE workspace.auto_insurance_fraud.customer_aggregations_inference ALTER COLUMN claim_id SET NOT NULL")
+
+# COMMAND ----------
+
+spark.sql("""
+    ALTER TABLE workspace.auto_insurance_fraud.customer_aggregations_inference
+    ALTER COLUMN claim_timestamp SET NOT NULL
+""")
+
+# COMMAND ----------
+
+spark.sql("""
+    ALTER TABLE workspace.auto_insurance_fraud.customer_aggregations_inference
+    ADD CONSTRAINT customer_aggregations_inference_pk
+    PRIMARY KEY (claim_id, claim_timestamp TIMESERIES)
 """)

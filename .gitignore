@@ -36,3 +36,8 @@ databricks/.cache/
 
 # WSL / Linux temporary files
 *.swp
+
+# Intellij IDEA / Jetbrains
+
+.idea/
+*.iml
