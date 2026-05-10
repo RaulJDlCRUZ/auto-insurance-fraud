@@ -21,8 +21,11 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
 matplotlib.use("Agg")  # Non-interactive backend: safe on cluster drivers with no display
 
-# pyspark.ml.evaluation removed: metrics now computed via scikit-learn in compute_metrics()
-# VarianceThresholdSelectorModel removed: sklearn pipeline uses VarianceThreshold instead
+from pyspark.ml.evaluation import (
+    BinaryClassificationEvaluator,
+    MulticlassClassificationEvaluator
+)
+from pyspark.ml.feature import VarianceThresholdSelectorModel
 from pyspark.sql import functions as F
 
 from sklearn.calibration import calibration_curve
@@ -628,48 +631,111 @@ prob_fraud_column = "prob_fraud"
 # This acts as a safety threshold.
 to_pandas_max_rows = 200_000
 
-def compute_metrics(y_true, y_prob, y_pred):
+def compute_metrics(predictions):
     """
-    Compute all six evaluation metrics from numpy arrays.
-
-    Parameters
-    ----------
-    y_true : array-like of int
-        Ground-truth binary labels (0 = legit, 1 = fraud).
-    y_prob : array-like of float
-        Predicted probability of the positive class (fraud).
-    y_pred : array-like of int
-        Hard binary predictions at the chosen decision threshold.
+    Compute all six evaluation metrics.
 
     Returns a plain dictionary so values can be returned seamlessly
     to the orchestrator notebook without any complex transformations.
     """
-    from sklearn.metrics import (
-        roc_auc_score,
-        average_precision_score,
-        f1_score,
-        precision_score,
-        recall_score,
-        accuracy_score,
+    eval_auc_roc = BinaryClassificationEvaluator(
+    labelCol=label_column,
+    rawPredictionCol=raw_prediction_column,
+    metricName="areaUnderROC",
+    )
+    eval_auc_pr = BinaryClassificationEvaluator(
+        labelCol=label_column,
+        rawPredictionCol=raw_prediction_column,
+        metricName="areaUnderPR",
+    )
+
+    eval_f1 = MulticlassClassificationEvaluator(
+        labelCol=label_column,
+        predictionCol=prediction_column,
+        metricName="f1",
+    )
+    eval_precision = MulticlassClassificationEvaluator(
+        labelCol=label_column,
+        predictionCol=prediction_column,
+        metricName="weightedPrecision",
+    )
+    eval_recall = MulticlassClassificationEvaluator(
+        labelCol=label_column,
+        predictionCol=prediction_column,
+        metricName="weightedRecall",
+    )
+    eval_accuracy = MulticlassClassificationEvaluator(
+        labelCol=label_column,
+        predictionCol=prediction_column,
+        metricName="accuracy",
     )
     return {
-        "auc_roc": float(roc_auc_score(y_true, y_prob)),
-        "auc_pr": float(average_precision_score(y_true, y_prob)),
-        "f1": float(f1_score(y_true, y_pred, zero_division=0)),
-        "precision": float(precision_score(y_true, y_pred, zero_division=0)),
-        "recall": float(recall_score(y_true, y_pred, zero_division=0)),
-        "accuracy": float(accuracy_score(y_true, y_pred)),
+        "auc_roc": eval_auc_roc.evaluate(predictions),
+        "auc_pr": eval_auc_pr.evaluate(predictions),
+        "f1": eval_f1.evaluate(predictions),
+        "precision": eval_precision.evaluate(predictions),
+        "recall": eval_recall.evaluate(predictions),
+        "accuracy": eval_accuracy.evaluate(predictions),
     }
 
 
-# to_pandas_predictions removed: evaluation job materializes Spark partitions
-# directly to pandas and calls pipeline_model.predict_proba() on the feature matrix.
+def to_pandas_predictions(predictions):
+    """
+    Convert the prediction columns to a pandas DataFrame.
+
+    Extracts the fraud probability from the probability vector at index 1
+    and adds it as a plain float column. Limits rows to prevent out-of-memory
+    errors on large datasets.
+    """
+    return (
+        predictions
+        .select(label_column, probability_column, prediction_column)
+        .limit(to_pandas_max_rows)
+        .toPandas()
+        .assign(
+            **{
+                prob_fraud_column: lambda df: df[probability_column].apply(
+                    lambda values: float(values[1])
+                )
+            }
+        )
+    )
 
 
-# extract_feature_names removed: replaced by extract_feature_names_sklearn()
-# defined inline in 07_Training_Job.py, which uses
-# pipeline_model.named_steps["preprocessor"].get_feature_names_out()
-# and pipeline_model.named_steps["var_selector"].get_support().
+def extract_feature_names(pipeline_model, sample_df):
+    """
+    Extracts the final feature names after VectorAssembler and VarianceThresholdSelector.
+    Requires transforming a single row to evaluate the one-hot encoded vector expansions.
+    """
+    attrs = (
+        pipeline_model
+        .transform(sample_df.limit(1))
+        .schema["features"]
+        .metadata["ml_attr"]["attrs"]
+    )
+
+    all_attrs = (
+        attrs.get("numeric", [])
+        + attrs.get("binary", [])
+        + attrs.get("nominal", [])
+    )
+
+    expanded_feature_names = [
+        attr["name"]
+        for attr in sorted(all_attrs, key=lambda x: x["idx"])
+    ]
+
+    var_selector_fitted = next(
+        stage for stage in pipeline_model.stages
+        if isinstance(stage, VarianceThresholdSelectorModel)
+    )
+
+    selected_feature_names = [
+        expanded_feature_names[i]
+        for i in var_selector_fitted.selectedFeatures
+    ]
+
+    return expanded_feature_names, selected_feature_names
 
 
 print("07_Utils.py script loaded successfully.")

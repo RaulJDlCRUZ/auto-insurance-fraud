@@ -5,6 +5,8 @@
 # MAGIC
 # MAGIC **Autor**: Juan Carlos Alfaro Jiménez
 # MAGIC
+# MAGIC > _Adaptado por Raúl Jiménez para el caso de uso de "Aseguradora de vehículos"_
+# MAGIC
 # MAGIC Esta libreta actúa como un **evaluador agnóstico e independiente** y no contiene ninguna llamada a `MLflow`. Su única responsabilidad es recibir la ruta de un modelo físico ya entrenado (`PipelineModel`), aplicarlo sobre la partición de datos que se le solicite (entrenamiento, validación o prueba), calcular las métricas de rendimiento y generar las figuras de diagnóstico. Finalmente, guarda los artefactos resultantes en un volumen de `Unity Catalog`.
 # MAGIC
 # MAGIC ### ¿Por qué desacoplar la evaluación de la orquestadora?
@@ -33,9 +35,7 @@ import gc
 import json
 from pathlib import Path
 
-import joblib
-import numpy as np
-import pandas as pd
+import mlflow.spark
 
 from sklearn.metrics import classification_report
 
@@ -103,34 +103,24 @@ print(dataset_description)
 
 # COMMAND ----------
 
-pipeline_model = joblib.load(model_artifact_uri)
-lr_fitted = pipeline_model.named_steps["classifier"]
+pipeline_model = mlflow.spark.load_model(model_artifact_uri)
+lr_fitted = pipeline_model.stages[-1]
 
-# Materialize eval partition to pandas and add engineered features
-eval_pandas_df = (
-    eval_df
-    .limit(to_pandas_max_rows)
-    .toPandas()
-)
+# COMMAND ----------
 
-eval_pandas_df["claimed_amount_log"] = np.log1p(eval_pandas_df["claimed_amount_eur"].fillna(0.0))
-eval_pandas_df["late_report_flag"] = (eval_pandas_df["days_to_report"].fillna(0) > 7).astype(int)
-eval_pandas_df["multi_party_flag"] = (eval_pandas_df["n_parties_involved"].fillna(0) > 2).astype(int)
+cols_to_fill = [
+    "total_amount_1h", "num_telematics_1h",
+    "total_amount_24h", "num_telematics_24h",
+    "total_amount_7d", "num_telematics_7d", "num_fraud_confirmed_7d",
+    "total_amount_30d", "num_telematics_30d", "num_fraud_confirmed_30d"
+]
 
-X_eval = eval_pandas_df.drop(
-    columns=[label_column, claim_id_column, policy_id_column, date_column, class_weight_column],
-    errors="ignore"
-)
+eval_df = eval_df.fillna(0, subset=cols_to_fill)
 
-y_eval = eval_pandas_df[label_column].astype(int).values
-p_eval = pipeline_model.predict_proba(X_eval)[:, 1]
-pred_eval = (p_eval >= 0.5).astype(int)
+# COMMAND ----------
 
-eval_metrics = compute_metrics(
-    y_true=y_eval,
-    y_prob=p_eval,
-    y_pred=pred_eval
-)
+eval_predictions = pipeline_model.transform(eval_df)
+eval_metrics = compute_metrics(eval_predictions)
 
 print(f"AUC-PR: {eval_metrics['auc_pr']:.4f}")
 print(f"AUC-ROC: {eval_metrics['auc_roc']:.4f}")
@@ -151,7 +141,11 @@ print(f"Accuracy: {eval_metrics['accuracy']:.4f}")
 
 # COMMAND ----------
 
-# y_eval, p_eval, pred_eval already computed above from joblib pipeline
+eval_pandas_df = to_pandas_predictions(eval_predictions)
+
+y_eval = eval_pandas_df[label_column].values
+p_eval = eval_pandas_df[prob_fraud_column].values
+pred_eval = eval_pandas_df[prediction_column].values
 
 best_threshold, best_f1_score = find_best_threshold(y_eval, p_eval)
 
@@ -229,7 +223,7 @@ print(f"Classification report successfully saved to {report_path}")
 
 # COMMAND ----------
 
-del pipeline_model, lr_fitted
+del eval_predictions, pipeline_model, lr_fitted
 gc.collect()
 
 result = {

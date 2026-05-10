@@ -5,6 +5,8 @@
 # MAGIC
 # MAGIC **Autor**: Juan Carlos Alfaro Jiménez
 # MAGIC
+# MAGIC > _Adaptado por Raúl Jiménez para el caso de uso de "Aseguradora de vehículos"_
+# MAGIC
 # MAGIC Esta libreta cubre la primera fase del ciclo `MLOps` profesional para el proyecto de detección de fraude en siniestros de automoción: **búsqueda de hiperparámetros usando los conjuntos de entrenamiento y validación**.
 # MAGIC
 # MAGIC El entrenamiento de cada modelo se delega en `07_Training_Job.ipynb` y la evaluación de métricas y generación de artefactos en `07_Evaluation_Job.ipynb`. Ambas se ejecutan en sesiones de `Spark Connect` completamente nuevas a través de `dbutils.notebook.run()`. Esta libreta se encarga exclusivamente de la instrumentación de `MLflow`.
@@ -52,12 +54,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import mlflow
-import mlflow.sklearn
+import mlflow.spark
 from mlflow import MlflowClient
 from mlflow.models.signature import infer_signature
 
 import pandas as pd
 
+from pyspark.ml import PipelineModel
 
 # COMMAND ----------
 
@@ -162,8 +165,7 @@ lr_threshold = 0.5
 
 lr_reg_param_list = [0.001, 0.01, 0.1]
 lr_elastic_net_param_list = [0.0, 0.5]
-lr_max_iter_list = [500]
-# lr_max_iter_list = [100] # Por defecto
+lr_max_iter_list = [100]
 n_grid = len(lr_reg_param_list) * len(lr_elastic_net_param_list) * len(lr_max_iter_list)
 
 print(f"For the missing value imputation step, the strategy is set to use the '{pp_imputer_strategy}' method to ensure robustness against outliers.")
@@ -242,10 +244,28 @@ mlflow.autolog(
 
 # COMMAND ----------
 
+new_exp_dirpath = f"/Workspace/Users/{current_user}/.experiments/{database}"
+
+try:
+  dbutils.fs.ls(new_exp_dirpath)
+except Exception:
+  # No existe el directorio entonces lo creamos
+  dbutils.fs.mkdirs(new_exp_dirpath)
+
 mlflow.set_experiment(mlflow_experiment_path)
 
 client = MlflowClient()
 experiment = mlflow.get_experiment_by_name(mlflow_experiment_path)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ##### Voy a verificar que el experimento se ha creado bien
+
+# COMMAND ----------
+
+experiment = mlflow.get_experiment_by_name(mlflow_experiment_path)
+print(experiment.experiment_id)
 
 # COMMAND ----------
 
@@ -447,27 +467,26 @@ def _log_convergence_metrics(convergence_metadata, max_iter):
 
 def _log_pipeline_model(model_save_path, input_example_path, output_example_path):
     """
-    Load the scikit-learn pipeline from the joblib file on the Unity Catalog volume
-    and log it to MLflow using mlflow.sklearn.
+    Load the model from the corresponding volume and log it.
 
-    The model is deleted from memory immediately after logging to avoid cache pressure.
-    model_save_path is the local path to the .joblib file written by 07_Training_Job.
+    The model is loaded here, so the orchestrator session never needs
+    to hold it in memory during the grid loop. The signature is inferred
+    from the `parquet` example files. The model is deleted from memory
+    immediately after logging to avoid cache pressure.
+
+    Requires `MLFLOW_DFS_TMP` to be set to a `Unity Catalog` volume path,
+    as `Serverless` clusters cannot serialize `Spark ML` models without a
+    volume-backed temporary directory.
     """
-    import joblib
-    pipeline_model = joblib.load(model_save_path)
+    pipeline_model = PipelineModel.load(model_save_path)
     input_example = pd.read_parquet(input_example_path)
     output_example = pd.read_parquet(output_example_path)
     signature = infer_signature(input_example, output_example)
 
-    mlflow.sklearn.log_model(
-        sk_model = pipeline_model,
+    mlflow.spark.log_model(
+        spark_model = pipeline_model,
         artifact_path = "pipeline_model",
-        signature = signature,
-        # evitar que mlflow.sklearn.log_model genere los ficheros de entorno problemáticos (restricciones de S3)
-        pip_requirements=[],
-        extra_pip_requirements=None,
-        conda_env=None
-        #input_example = input_example # sirve para que MLflow genere código de inferencia automático en la UI. Desactivado por restricciones
+        signature = signature
     )
 
     del pipeline_model
@@ -489,14 +508,9 @@ def _log_split_metrics(train_metrics, validation_metrics):
     train_prefixed = {f"train_{key}": value for key, value in train_metrics.items()}
     val_prefixed = {f"val_{key}": value for key, value in validation_metrics.items()}
 
-    # mlflow.log_metrics(train_prefixed, dataset = mlflow_train_ds)
-    # mlflow.log_metrics(train_prefixed)
-    # mlflow.log_metrics(val_prefixed, dataset = mlflow_validation_ds)
-    # mlflow.log_metrics(val_prefixed)
-
-    train_prefixed = {f"train_{key}": value for key, value in train_metrics.items()}
-    val_prefixed = {f"val_{key}": value for key, value in validation_metrics.items()}
+    mlflow.log_metrics(train_prefixed, dataset = mlflow_train_ds)
     mlflow.log_metrics(train_prefixed)
+    mlflow.log_metrics(val_prefixed, dataset = mlflow_validation_ds)
     mlflow.log_metrics(val_prefixed)
 
     gap_auc_pr = train_metrics["auc_pr"] - validation_metrics["auc_pr"]
@@ -636,7 +650,7 @@ def run_lr_experiment(reg_param, elastic_net_param, max_iter, parent_run_id):
             training_result["output_example_path"]
         )
 
-        model_artifact_uri = training_result["model_save_path"]
+        model_artifact_uri = f"runs:/{run_id}/pipeline_model"
 
         train_eval_json = dbutils.notebook.run(
             evaluation_notebook_path,
@@ -957,7 +971,7 @@ candidate_run_id = child_runs_df.iloc[0]["run_id"]
 candidate_run = client.get_run(candidate_run_id)
 
 pipeline_artifact_path = "pipeline_model"
-candidate_model_uri = f"runs:/{candidate_run_id}/{pipeline_artifact_path}"  # mlflow.sklearn logged artifact
+candidate_model_uri = f"runs:/{candidate_run_id}/{pipeline_artifact_path}"
 
 print(f"Run identifier: {candidate_run_id}")
 print(f"Run name: {candidate_run.data.tags.get('mlflow.runName', 'n/a')}")
@@ -1026,23 +1040,15 @@ print(f"Tracked tags: {candidate_run.data.tags}")
 
 objective_history = client.get_metric_history(candidate_run_id, "lr_objective_history")
 
-if objective_history:
-    print(f"Convergence history: {len(objective_history)} steps")
-    print(f"Initial loss: {objective_history[0].value:.6f}")
-    print(f"Final loss: {objective_history[-1].value:.6f}")
-    print(f"Total drop: {objective_history[0].value - objective_history[-1].value:.6f}")
-    print()
-    print("First 5 steps:")
-    for entry in objective_history[:5]:
-        print(f"Step {entry.step} with value {entry.value:.6f}")
-else:
-    print("Convergence history not available (sklearn solver does not expose per-iteration loss).")
-    total_iter_history = client.get_metric_history(candidate_run_id, "lr_total_iterations")
-    if total_iter_history:
-        print(f"Total iterations: {total_iter_history[-1].value:.0f}")
-    converged_history = client.get_metric_history(candidate_run_id, "lr_converged")
-    if converged_history:
-        print(f"Converged: {bool(converged_history[-1].value)}")
+print(f"Convergence history: {len(objective_history)} steps")
+print(f"Initial loss: {objective_history[0].value:.6f}")
+print(f"Final loss: {objective_history[-1].value:.6f}")
+print(f"Total drop: {objective_history[0].value - objective_history[-1].value:.6f}")
+print()
+
+print("First 5 steps:")
+for entry in objective_history[:5]:
+    print(f"Step {entry.step} with value {entry.value:.6f}")
 
 # COMMAND ----------
 
@@ -1094,15 +1100,9 @@ for artifact in client.list_artifacts(candidate_run_id):
 
 # COMMAND ----------
 
-# uc_model_version = mlflow.register_model(
-#     model_uri = candidate_model_uri,
-#     name = uc_model_name
-# )
-
-uc_model_version = client.create_model_version(
-    name = uc_model_name,
-    source = candidate_run.info.artifact_uri + "/pipeline_model",
-    run_id = candidate_run_id
+uc_model_version = mlflow.register_model(
+    model_uri = candidate_model_uri,
+    name = uc_model_name
 )
 
 print(f"Registered model: {uc_model_name}")

@@ -5,6 +5,8 @@
 # MAGIC
 # MAGIC **Autor**: Juan Carlos Alfaro Jiménez
 # MAGIC
+# MAGIC > _Adaptado por Raúl Jiménez para el caso de uso de "Aseguradora de vehículos"_
+# MAGIC
 # MAGIC Esta libreta **no contiene ninguna llamada a `MLflow`**. Su única responsabilidad es aislar el entrenamiento de un único `PipelineModel` de `MLlib` utilizando los hiperparámetros recibidos. Durante su ejecución independiente, ajustará el modelo a los datos y guardará el artefacto físico resultante directamente en un volumen de `Unity Catalog`.
 # MAGIC
 # MAGIC ### ¿Por qué desacoplar el entrenamiento de la orquestadora?
@@ -359,6 +361,47 @@ lr_clf = LogisticRegression(
 
 pipeline_stages = preprocessing_stages + [lr_clf]
 full_pipeline = Pipeline(stages = pipeline_stages)
+
+# COMMAND ----------
+
+from pyspark.sql.functions import col, sum as spark_sum, isnan, when
+
+# Columnas que entran al VectorAssembler (las OHE + numéricas)
+assembler_input_cols = [
+    "accident_location_type_ohe", "witnesses_ohe", "injury_level_ohe",
+    "claim_channel_ohe", "body_shop_id_ohe", "age_group_ohe",
+    "gender_ohe", "region_ohe", "region_type_ohe", "occupation_ohe",
+    "coverage_type_ohe", "payment_frequency_ohe", "vehicle_make_ohe",
+    "vehicle_type_ohe", "vehicle_age_group_ohe",
+    "claimed_amount_log",
+    "late_report_flag_double_VectorAssembler_64a9cc671b78",
+    "multi_party_flag_double_VectorAssembler_64a9cc671b78"
+]
+
+null_counts = train_weighted.select([
+    spark_sum(col(c).isNull().cast("int")).alias(c)
+    for c in train_weighted.columns
+])
+
+null_counts.show(vertical=True)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC El Imputer cubre algunos campos de ventanas (`avg_amount_*`, `fraud_rate_30d`...) pero deja fuera columnas que **entran directamente al VectorAssembler con nulos**.
+
+# COMMAND ----------
+
+cols_to_fill = [
+    "total_amount_1h", "num_telematics_1h",
+    "total_amount_24h", "num_telematics_24h",
+    "total_amount_7d", "num_telematics_7d", "num_fraud_confirmed_7d",
+    "total_amount_30d", "num_telematics_30d", "num_fraud_confirmed_30d"
+]
+
+train_weighted = train_weighted.fillna(0, subset=cols_to_fill)
+
+# COMMAND ----------
 
 pipeline_model = full_pipeline.fit(train_weighted)
 
